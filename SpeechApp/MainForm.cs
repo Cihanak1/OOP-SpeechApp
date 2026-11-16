@@ -1,15 +1,21 @@
 using System;
 using System.Drawing;
-using System.Speech.Recognition;
+using System.IO;
 using System.Speech.Synthesis;
+using System.Text.Json;
 using System.Windows.Forms;
+using NAudio.Wave;
+using Vosk;
 
 namespace SpeechApp;
 
 public partial class MainForm : Form
 {
     private SpeechSynthesizer? synthesizer;
-    private SpeechRecognitionEngine? recognizer;
+
+    private Model? voskModel;
+    private VoskRecognizer? voskRecognizer;
+    private WaveInEvent? waveIn;
     private bool isListening = false;
 
     public MainForm()
@@ -42,7 +48,14 @@ public partial class MainForm : Form
 
             synthesizer.SpeakCompleted += (s, e) =>
             {
-                lblStatus.Text = "Durum: Seslendirme tamamlandı.";
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() => lblStatus.Text = "Durum: Seslendirme tamamlandı."));
+                }
+                else
+                {
+                    lblStatus.Text = "Durum: Seslendirme tamamlandı.";
+                }
             };
         }
         catch (Exception)
@@ -94,63 +107,179 @@ public partial class MainForm : Form
         }
     }
 
+    private string FindModelPath()
+    {
+        string path1 = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "model");
+        if (Directory.Exists(path1))
+        {
+            return path1;
+        }
+
+        string path2 = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "model");
+        if (Directory.Exists(path2))
+        {
+            return Path.GetFullPath(path2);
+        }
+
+        if (Directory.Exists("model"))
+        {
+            return Path.GetFullPath("model");
+        }
+
+        return string.Empty;
+    }
+
     private void btnStartListening_Click(object? sender, EventArgs e)
     {
-        if (SpeechRecognitionEngine.InstalledRecognizers().Count == 0)
+        if (isListening)
         {
-            MessageBox.Show("Bu bilgisayarda konuşma tanıma desteği bulunamadı.", "Bilgi", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            lblStatus.Text = "Durum: Konuşma tanıyıcı bulunamadı.";
             return;
         }
 
-        if (isListening)
+        string modelPath = FindModelPath();
+        if (string.IsNullOrEmpty(modelPath))
+        {
+            MessageBox.Show("Vosk model klasörü bulunamadı. Lütfen 'model' klasörünün proje içinde veya programın yanında olduğundan emin olun.", "Model Bulunamadı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            lblStatus.Text = "Durum: Model klasörü bulunamadı.";
+            return;
+        }
+
+        try
+        {
+            if (voskModel == null)
+            {
+                Vosk.Vosk.SetLogLevel(-1);
+                voskModel = new Model(modelPath);
+            }
+
+            if (voskRecognizer == null)
+            {
+                voskRecognizer = new VoskRecognizer(voskModel, 16000.0f);
+            }
+
+            if (WaveInEvent.DeviceCount == 0)
+            {
+                MessageBox.Show("Sistemde kullanılabilir bir mikrofon bulunamadı.", "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                lblStatus.Text = "Durum: Mikrofon bulunamadı.";
+                return;
+            }
+
+            waveIn = new WaveInEvent();
+            waveIn.DeviceNumber = 0;
+            waveIn.WaveFormat = new WaveFormat(16000, 16, 1);
+            waveIn.BufferMilliseconds = 100;
+            waveIn.DataAvailable += WaveIn_DataAvailable;
+            waveIn.RecordingStopped += WaveIn_RecordingStopped;
+
+            waveIn.StartRecording();
+            isListening = true;
+            lblStatus.Text = "Durum: Dinleniyor, lütfen Türkçe konuşun...";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Konuşma tanıma başlatılamadı: " + ex.Message, "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            lblStatus.Text = "Durum: Dinleme başlatılamadı.";
+            StopListening();
+        }
+    }
+
+    private void btnStopListening_Click(object? sender, EventArgs e)
+    {
+        StopListening();
+    }
+
+    private void StopListening()
+    {
+        if (isListening && waveIn != null)
+        {
+            try
+            {
+                waveIn.StopRecording();
+            }
+            catch
+            {
+            }
+        }
+        isListening = false;
+        lblStatus.Text = "Durum: Dinleme durduruldu.";
+    }
+
+    private void WaveIn_DataAvailable(object? sender, WaveInEventArgs e)
+    {
+        if (voskRecognizer == null || !isListening)
         {
             return;
         }
 
         try
         {
-            if (recognizer == null)
+            if (voskRecognizer.AcceptWaveform(e.Buffer, e.BytesRecorded))
             {
-                recognizer = new SpeechRecognitionEngine();
-                recognizer.SetInputToDefaultAudioDevice();
-                recognizer.LoadGrammar(new DictationGrammar());
-                recognizer.SpeechRecognized += Recognizer_SpeechRecognized;
+                string jsonResult = voskRecognizer.Result();
+                string recognizedText = ExtractTextFromJson(jsonResult);
+                if (!string.IsNullOrWhiteSpace(recognizedText))
+                {
+                    AppendRecognizedText(recognizedText);
+                }
             }
-
-            recognizer.RecognizeAsync(RecognizeMode.Multiple);
-            isListening = true;
-            lblStatus.Text = "Durum: Dinleniyor, lütfen konuşun...";
         }
-        catch (Exception ex)
+        catch
         {
-            MessageBox.Show("Konuşma tanıma başlatılamadı: " + ex.Message, "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            lblStatus.Text = "Durum: Dinleme başlatılamadı.";
         }
     }
 
-    private void btnStopListening_Click(object? sender, EventArgs e)
+    private void WaveIn_RecordingStopped(object? sender, StoppedEventArgs e)
     {
-        if (recognizer != null && isListening)
+        if (voskRecognizer != null)
         {
             try
             {
-                recognizer.RecognizeAsyncStop();
+                string finalJson = voskRecognizer.FinalResult();
+                string finalWord = ExtractTextFromJson(finalJson);
+                if (!string.IsNullOrWhiteSpace(finalWord))
+                {
+                    AppendRecognizedText(finalWord);
+                }
             }
             catch
             {
             }
-            isListening = false;
-            lblStatus.Text = "Durum: Dinleme durduruldu.";
+        }
+
+        if (waveIn != null)
+        {
+            waveIn.DataAvailable -= WaveIn_DataAvailable;
+            waveIn.RecordingStopped -= WaveIn_RecordingStopped;
+            waveIn.Dispose();
+            waveIn = null;
         }
     }
 
-    private void Recognizer_SpeechRecognized(object? sender, SpeechRecognizedEventArgs e)
+    private string ExtractTextFromJson(string json)
     {
-        if (!string.IsNullOrWhiteSpace(e.Result.Text))
+        try
         {
-            txtRecognizedText.AppendText(e.Result.Text + Environment.NewLine);
+            using JsonDocument doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("text", out JsonElement textElement))
+            {
+                return textElement.GetString() ?? string.Empty;
+            }
         }
+        catch
+        {
+        }
+        return string.Empty;
+    }
+
+    private void AppendRecognizedText(string text)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(new Action(() => AppendRecognizedText(text)));
+            return;
+        }
+
+        txtRecognizedText.AppendText(text + Environment.NewLine);
     }
 
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
@@ -160,11 +289,10 @@ public partial class MainForm : Form
             synthesizer?.SpeakAsyncCancelAll();
             synthesizer?.Dispose();
 
-            if (isListening)
-            {
-                recognizer?.RecognizeAsyncStop();
-            }
-            recognizer?.Dispose();
+            StopListening();
+
+            voskRecognizer?.Dispose();
+            voskModel?.Dispose();
         }
         catch
         {
